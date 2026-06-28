@@ -156,19 +156,31 @@ _KEY_CODE = {
     "D": "0x88", "E": "0x84", "F": "0x82",
 }
 
-# mapeia o "nome" da tecla para o indice (0..15) que read_key devolve,
-# de acordo com a ordem real da keymap do Digital Lab Sim:
-#   keymap: .byte 0x11,0x21,0x41,0x81, 0x12,0x22,0x42,0x82,
-#                  0x14,0x24,0x44,0x84, 0x18,0x28,0x48,0x88
-#   pos:         0    1    2    3     4    5    6    7
-#                8    9   10   11    12   13   14   15
-# 0x11=tecla1->idx0, 0x81=tecla0->idx3, 0x18=teclaA->idx12, etc.
+# Teclado visual do Digital Lab Sim:
+#   0 1 2 3
+#   4 5 6 7
+#   8 9 A B
+#   C D E F
+# read_key retorna directamente o valor da tecla:
+# tecla 0 -> indice 0, tecla 1 -> indice 1, ..., tecla A -> indice 10, etc.
 _KEY_INDEX = {
-    "1":  0, "4":  1, "7":  2, "0":  3,
-    "2":  4, "5":  5, "8":  6, "F":  7,
-    "3":  8, "6":  9, "9": 10, "E": 11,
-    "A": 12, "B": 13, "C": 14, "D": 15,
+    "0":  0, "1":  1, "2":  2, "3":  3,
+    "4":  4, "5":  5, "6":  6, "7":  7,
+    "8":  8, "9":  9, "A": 10, "B": 11,
+    "C": 12, "D": 13, "E": 14, "F": 15,
 }
+
+
+# ---------------------------------------------------------------------------
+# Modulo Bitmap (Bitmap Display do MARS)
+# ---------------------------------------------------------------------------
+_BITMAP_BASE   = "0x10010000"  # endereco base do Bitmap Display (512x256)
+_BITMAP_WIDTH  = 512
+_BITMAP_HEIGHT = 256
+
+# padrao de token numerico: decimal (inteiro com sinal) OU hexadecimal (0x...)
+# usado nos regex das instrucoes Bitmap que aceitam cores em hex
+_NUM_PAT = r"(?:0[xX][0-9A-Fa-f]+|-?\d+|[A-Za-z_]\w*)"
 
 
 # ---------------------------------------------------------------------------
@@ -189,13 +201,15 @@ class CodeGen:
         self._uses_div = False   # True se DIV foi usado -> inclui rotina div_segura
         self._uses_display = False  # True se Display1/Display2 foi usado
         self._uses_keyboard = False  # True se [IMPOR] Teclado; e OnClick foram usados
-        self._uses_event_loop = False  # True se pelo menos um OnClick foi registrado
         self._uses_strcmp = False  # True se alguma condicao comparou strings
         self._string_literals = {}  # texto (sem aspas) -> label, usado em condicoes tipo H == "QAT 01"
         self._uses_readfile = False  # True se READFILE foi usado
         self._uses_writefile = False  # True se WRITEFILE foi usado
+        self._uses_strcpy = False  # True se str(H, "...") foi usado
+        self._uses_bitmap = False  # True se [IMPOR] Bitmap; foi usado
         self._onclick_callbacks = []  # textos assembly dos callbacks de OnClick gerados
         self._onclick_data_decls = []  # declaracoes .data dos callbacks (memoria isolada)
+        self._callkey_labels = {}  # tecla -> label do corpo do CALLKEY (ex: '1' -> 'callkey_1_body')
         self._function_exit_label = None  # se setado, 'return' salta para ca em vez de jr $ra direto
 
     def emit(self, text: str):
@@ -224,6 +238,23 @@ class CodeGen:
 \tli $t5, {value}
 \tla $s0, data
 \tsw $t5, {off}($s0)""")
+
+    # --- str(H, "QAT 01") -> copia a string literal para o buffer de H ------
+    def gen_str_literal(self, var: str, text: str):
+        """
+        Atribui uma string literal a uma variavel str, usando strcpy para
+        copiar o conteudo para dentro do buffer da variavel (buffer_H).
+        Isso garante que out.H, strcmp, WRITEFILE, etc continuam
+        funcionando sem nenhuma mudanca: o buffer ja contem a string pronta.
+        """
+        self._uses_strcpy = True
+        buffer_label = self.symtab.resolve_str(var)
+        str_label = self._string_literal_label(f'"{text}"')
+        self.emit(f"""\
+\t# str({var},"{text}")
+\tla $a0, {buffer_label}
+\tla $a1, {str_label}
+\tjal strcpy""")
 
     # --- out.X (inteiro) -----------------------------------------------------
     def gen_out_int(self, var: str):
@@ -393,6 +424,42 @@ done_nl_{var}:""")
 \tli $t6, {addr}
 \tsb $zero, 0($t6)""")
 
+    # --- Bitmap.set_pixel(x, y, cor) -----------------------------------------
+    def gen_bitmap_set_pixel(self, x_tok: str, y_tok: str, cor_tok: str):
+        self._uses_bitmap = True
+        self.emit(f"""\
+\t# Bitmap.set_pixel({x_tok}, {y_tok}, {cor_tok})
+{self._load_operand(x_tok, "$a0")}
+{self._load_operand(y_tok, "$a1")}
+{self._load_operand(cor_tok, "$a2")}
+\tjal set_pixel""")
+
+    # --- Bitmap.fill_screen(cor) ---------------------------------------------
+    def gen_bitmap_fill_screen(self, cor_tok: str):
+        self._uses_bitmap = True
+        self.emit(f"""\
+\t# Bitmap.fill_screen({cor_tok})
+{self._load_operand(cor_tok, "$a0")}
+\tjal fill_screen""")
+
+    # --- Bitmap.draw_square(x, y, tamanho, cor) ------------------------------
+    def gen_bitmap_draw_square(self, x_tok: str, y_tok: str, size_tok: str, cor_tok: str):
+        self._uses_bitmap = True
+        self.emit(f"""\
+\t# Bitmap.draw_square({x_tok}, {y_tok}, {size_tok}, {cor_tok})
+{self._load_operand(x_tok, "$a0")}
+{self._load_operand(y_tok, "$a1")}
+{self._load_operand(size_tok, "$a2")}
+{self._load_operand(cor_tok, "$a3")}
+\tjal draw_square""")
+
+    # --- Bitmap.clear_screen() -----------------------------------------------
+    def gen_bitmap_clear_screen(self):
+        self._uses_bitmap = True
+        self.emit("""\
+\t# Bitmap.clear_screen()
+\tjal clear_screen""")
+
     # --- CALL(funcao, arg1, arg2, ...).dest ---------------------------------
     def gen_call(self, func_name: str, args: list, dest: str):
         """
@@ -410,34 +477,62 @@ done_nl_{var}:""")
         off_dest = self.symtab.resolve_int(dest)
         self.emit(f"\tla $s0, data\n\tsw $v0, {off_dest}($s0)")
 
-    # --- OnClick(N) { ... } (registra callback na tabela, event_loop dispara) -
+    # --- OnClick(N) { ... } (chamada bloqueante no fluxo principal) ---------
     def gen_onclick_call(self, key_name: str, callback_label: str):
         """
-        Registra o callback da tecla na tabela key_callbacks via bind_key.
-        O event_loop (gerado automaticamente no fim do main) escuta as
-        teclas com read_key e dispara o callback registado -- completamente
-        dinamico, qualquer tecla pode ser pressionada a qualquer momento.
+        Emite a chamada bloqueante a wait_for_key no ponto onde
+        'OnClick(N) { ... }' aparece no programa: o fluxo para ali ate a
+        tecla certa ser pressionada, executa o callback, e so entao
+        continua para a proxima linha do .vic.
         """
         self._uses_keyboard = True
-        self._uses_event_loop = True
         key_index = _KEY_INDEX[key_name]
         self.emit(f"""\
-\t# OnClick({key_name}) {{ ... }} -> registra callback
+\t# OnClick({key_name}) {{ ... }}
 \tli $a0, {key_index}
 \tla $a1, {callback_label}
-\tjal bind_key""")
+\tjal wait_for_key""")
+
+    # --- CALLKEY.(N)  (nao-bloqueante, usa dentro de While/For) ------------
+    def gen_callkey_call(self, key_name: str):
+        """
+        Emite uma verificacao NAO-BLOQUEANTE da tecla usando read_key
+        (com nop e keymap correta). Compara o INDICE retornado com o
+        indice da tecla N. Se bater: chama wait_release (debounce) e
+        depois o corpo. Se nao bater: pula e o loop continua normalmente.
+        """
+        self._uses_keyboard = True
+        key_index = _KEY_INDEX[key_name]
+        if key_name not in self._callkey_labels:
+            raise NameError(
+                f"'CALLKEY.({key_name})' usado sem 'Funct.CALLKEY.({key_name}){{...}}' "
+                f"declarado antes no arquivo"
+            )
+        body_label = self._callkey_labels[key_name]
+        skip_label = self._new_label(f"callkey_skip_{key_name}")
+        self.emit(f"""\
+\t# CALLKEY.({key_name})
+\tjal read_key
+\tli $t9, {key_index}
+\tbne $v0, $t9, {skip_label}
+\tjal wait_release
+\tjal {body_label}
+{skip_label}:""")
 
     # --- carrega um operando (variavel int ou literal numerico) em um registrador
     def _load_operand(self, token: str, reg: str) -> str:
         """
         Devolve as linhas de assembly que colocam o valor de 'token' (nome
-        de variavel int, ou literal numerico tipo '10' ou '-3') dentro do
-        registrador 'reg'. Usado para montar condicoes de if.
+        de variavel int, literal decimal '10'/'-3', ou literal hex '0xFF0000')
+        dentro do registrador 'reg'.
         """
+        # literal decimal (positivo ou negativo)
         if token.lstrip("-").isdigit():
             return f"\tli {reg}, {token}"
-        # e nome de variavel: precisa existir e ser int (string nao
-        # participa de comparacao relacional, por enquanto)
+        # literal hexadecimal (ex: 0xFF0000 para cores do Bitmap)
+        if token.lower().startswith("0x"):
+            return f"\tli {reg}, {token}"
+        # variavel int
         if not self.symtab.exists(token):
             raise NameError(f"Variavel '{token}' usada em condicao antes de ser definida")
         if self.symtab.type_of(token) != "int":
@@ -758,21 +853,17 @@ done_nl_{var}:""")
             table_values = ", ".join(f"0x{v:02X}" for v in _SEG_TABLE)
             data_lines.append(f"seg_table: .byte {table_values}")
 
-        # keymap e tabela de callbacks -- so incluidas se OnClick for usado
-        if self._uses_event_loop:
+        # keymap do teclado: incluida sempre que o modulo Teclado e usado
+        if self._uses_keyboard:
             data_lines.append(
-                "vic_keymap: .byte 0x11,0x21,0x41,0x81,"
+                "vic_keymap: .byte "
+                "0x11,0x21,0x41,0x81,"
                 "0x12,0x22,0x42,0x82,"
                 "0x14,0x24,0x44,0x84,"
                 "0x18,0x28,0x48,0x88"
             )
-            data_lines.append("key_callbacks: .word 0:16")
 
         data_section = "\n\t".join(data_lines)
-
-        # se houver OnClick, injeta 'jal event_loop' no corpo do main
-        # ANTES do syscall 10 -- o event_loop nunca retorna sozinho
-        event_loop_call = "\n\tjal event_loop" if self._uses_event_loop else ""
         body = "\n".join(self.lines)
 
         # rotinas seguras: ficam DEPOIS do corpo do main, isoladas, e so
@@ -870,75 +961,46 @@ show_digit:
 
 # =============================================
 # read_key - Varre as 4 linhas e devolve o indice na vic_keymap
-# Entrada: nenhuma
-# Saida:   $v0 = 0..15 (indice: 0=tecla1, 3=tecla0, 12=teclaA...), ou -1
+# Saida: $v0 = 0..15 ou -1 se nenhuma tecla premida
+# O nop e essencial para o sinal do hardware estabilizar entre linhas
 # =============================================
 read_key:
-\tli   $t0, 0xFFFF0012
-\tli   $t1, 0xFFFF0014
-\tli   $t2, 1
-scan_row:
-\tsb   $t2, 0($t0)
-\tnop
-\tlbu  $t3, 0($t1)
-\tbnez $t3, rk_decode
-\tsll  $t2, $t2, 1
-\tblt  $t2, 16, scan_row
-\tli   $v0, -1
-\tjr   $ra
+	li   $t0, 0xFFFF0012
+	li   $t1, 0xFFFF0014
+	li   $t2, 1
+rk_scan_row:
+	sb   $t2, 0($t0)
+	nop
+	lbu  $t3, 0($t1)
+	bnez $t3, rk_decode
+	sll  $t2, $t2, 1
+	blt  $t2, 16, rk_scan_row
+	li   $v0, -1
+	jr   $ra
 rk_decode:
-\tla   $t4, vic_keymap
-\tli   $t5, 0
+	la   $t4, vic_keymap
+	li   $t5, 0
 rk_search:
-\tlbu  $t6, 0($t4)
-\tbeq  $t3, $t6, rk_found
-\taddiu $t4, $t4, 1
-\taddiu $t5, $t5, 1
-\tblt  $t5, 16, rk_search
-\tli   $v0, -1
-\tjr   $ra
+	lbu  $t6, 0($t4)
+	beq  $t3, $t6, rk_found
+	addiu $t4, $t4, 1
+	addiu $t5, $t5, 1
+	blt  $t5, 16, rk_search
+	li   $v0, -1
+	jr   $ra
 rk_found:
-\tmove $v0, $t5
-\tjr   $ra
+	move $v0, $t5
+	jr   $ra
 
 # =============================================
 # wait_release - Espera a tecla ser solta (debounce)
 # =============================================
 wait_release:
-\tli   $t0, 0xFFFF0014
+	li   $t0, 0xFFFF0014
 wr_loop:
-\tlbu  $t1, 0($t0)
-\tbnez $t1, wr_loop
-\tjr   $ra
-
-# =============================================
-# bind_key - Registra um callback para um indice de tecla
-# Entrada: $a0 = indice (0..15, segundo vic_keymap)
-#          $a1 = endereco da funcao callback
-# =============================================
-bind_key:
-\tla   $t0, key_callbacks
-\tsll  $a0, $a0, 2
-\tadd  $t0, $t0, $a0
-\tsw   $a1, 0($t0)
-\tjr   $ra
-
-# =============================================
-# event_loop - Escuta teclas e dispara callbacks registados
-# Nunca retorna; loop infinito ate syscall 10 no callback
-# =============================================
-event_loop:
-\tjal  read_key
-\tbltz $v0, event_loop
-\tmove $s0, $v0
-\tjal  wait_release
-\tsll  $s0, $s0, 2
-\tla   $t0, key_callbacks
-\tadd  $t0, $t0, $s0
-\tlw   $t1, 0($t0)
-\tbeqz $t1, event_loop
-\tjalr $t1
-\tj    event_loop"""
+	lbu  $t1, 0($t0)
+	bnez $t1, wr_loop
+	jr   $ra"""
 
         if self._uses_strcmp:
             routines += """
@@ -1088,6 +1150,117 @@ wf_exit:
 \taddi $sp, $sp, 16
 \tjr   $ra"""
 
+        if self._uses_strcpy:
+            routines += """
+
+# =============================================
+# strcpy - Copia string terminada em \\0 (usada por str(H, "..."))
+# Entrada: $a0 = destino, $a1 = fonte
+# =============================================
+strcpy:
+\tlb   $t0, 0($a1)
+\tsb   $t0, 0($a0)
+\tbeq  $t0, $zero, strcpy_fim
+\taddi $a0, $a0, 1
+\taddi $a1, $a1, 1
+\tj    strcpy
+strcpy_fim:
+\tjr   $ra"""
+
+        if self._uses_bitmap:
+            routines += f"""
+
+# =============================================================
+# Biblioteca Bitmap para MARS (512x256, base {_BITMAP_BASE})
+# =============================================================
+
+# --- dados do Bitmap (injetados no .text como labels locais) ---
+BITMAP_BASE:
+\t.word {_BITMAP_BASE}
+SCREEN_WIDTH:
+\t.word {_BITMAP_WIDTH}
+SCREEN_HEIGHT:
+\t.word {_BITMAP_HEIGHT}
+
+# -------------------------------------------------------------
+# set_pixel: acende um pixel em (x, y) com a cor dada
+#   $a0 = x, $a1 = y, $a2 = cor (0x00RRGGBB)
+# -------------------------------------------------------------
+set_pixel:
+\tlw    $t0, BITMAP_BASE
+\tlw    $t1, SCREEN_WIDTH
+\tmul   $t2, $a0, 4
+\tmul   $t3, $t1, 4
+\tmul   $t3, $t3, $a1
+\tadd   $t4, $t0, $t2
+\tadd   $t4, $t4, $t3
+\tsw    $a2, 0($t4)
+\tjr    $ra
+
+# -------------------------------------------------------------
+# fill_screen: preenche toda a tela com a cor
+#   $a0 = cor
+# -------------------------------------------------------------
+fill_screen:
+\tlw    $t0, BITMAP_BASE
+\tlw    $t1, SCREEN_WIDTH
+\tlw    $t2, SCREEN_HEIGHT
+\tli    $t3, 0
+fs_loop_y:
+\tbge   $t3, $t2, fs_done
+\tli    $t4, 0
+fs_loop_x:
+\tbge   $t4, $t1, fs_next_y
+\tmul   $t5, $t4, 4
+\tmul   $t6, $t1, 4
+\tmul   $t6, $t6, $t3
+\tadd   $t7, $t0, $t5
+\tadd   $t7, $t7, $t6
+\tsw    $a0, 0($t7)
+\taddi  $t4, $t4, 1
+\tj     fs_loop_x
+fs_next_y:
+\taddi  $t3, $t3, 1
+\tj     fs_loop_y
+fs_done:
+\tjr    $ra
+
+# -------------------------------------------------------------
+# draw_square: quadrado preenchido N x N
+#   $a0 = x, $a1 = y, $a2 = tamanho N, $a3 = cor
+# -------------------------------------------------------------
+draw_square:
+\tlw    $t0, BITMAP_BASE
+\tlw    $t1, SCREEN_WIDTH
+\tmove  $t2, $a1
+\tadd   $t3, $a1, $a2
+ds_loop_y:
+\tbge   $t2, $t3, ds_done
+\tmove  $t4, $a0
+\tadd   $t5, $a0, $a2
+ds_loop_x:
+\tbge   $t4, $t5, ds_next_y
+\tmul   $t6, $t4, 4
+\tmul   $t7, $t1, 4
+\tmul   $t7, $t7, $t2
+\tadd   $t8, $t0, $t6
+\tadd   $t8, $t8, $t7
+\tsw    $a3, 0($t8)
+\taddi  $t4, $t4, 1
+\tj     ds_loop_x
+ds_next_y:
+\taddi  $t2, $t2, 1
+\tj     ds_loop_y
+ds_done:
+\tjr    $ra
+
+# -------------------------------------------------------------
+# clear_screen: limpa a tela (preto)
+# -------------------------------------------------------------
+clear_screen:
+\tli    $a0, 0x00000000
+\tj     fill_screen"""
+
         # tratador de excecoes de hardware (.ktext): segunda camada de
         # protecao, caso uma instrucao perigosa (mult/div fora das rotinas
         # seguras, ou overflow de 'add') dispare excecao diretamente.
@@ -1155,7 +1328,7 @@ excecao_tratada:
 .globl main
 main:
 {body}
-{event_loop_call}
+
 \tli $v0, 10
 \tsyscall{user_functions_section}{routines}{ktext_section}
 """
@@ -1251,6 +1424,10 @@ RE_DIV = re.compile(
 RE_INT_LITERAL = re.compile(
     r"^int\(\s*([A-Za-z_]\w*)\s*,\s*(-?\d+)\s*\)$"
 )
+# str(H, "QAT 01")  -> atribui a string literal "QAT 01" diretamente a H
+RE_STR_LITERAL = re.compile(
+    r'^str\(\s*([A-Za-z_]\w*)\s*,\s*"([^"]*)"\s*\)$'
+)
 RE_IF_OPEN = re.compile(r"^if\s*\((.+)\)\s*\{$")
 RE_ELSE_OPEN = re.compile(r"^\}\s*else\s*\{$")
 RE_BLOCK_CLOSE = re.compile(r"^\}$")
@@ -1311,9 +1488,29 @@ RE_DISPLAY_SHOW_DIGIT = re.compile(
 )
 RE_DISPLAY_CLEAR = re.compile(r"^(Display[12])\.clear\(\)$")
 
+# --- modulo Bitmap --------------------------------------------------------
+# token numerico: hex (0x...) ou decimal ou variavel
+_N = r"(?:0[xX][0-9A-Fa-f]+|-?\d+|[A-Za-z_]\w*)"
+RE_BITMAP_SET_PIXEL = re.compile(
+    rf"^Bitmap\.set_pixel\(\s*({_N})\s*,\s*({_N})\s*,\s*({_N})\s*\)$"
+)
+RE_BITMAP_FILL = re.compile(
+    rf"^Bitmap\.fill_screen\(\s*({_N})\s*\)$"
+)
+RE_BITMAP_DRAW_SQUARE = re.compile(
+    rf"^Bitmap\.draw_square\(\s*({_N})\s*,\s*({_N})\s*,\s*({_N})\s*,\s*({_N})\s*\)$"
+)
+RE_BITMAP_CLEAR = re.compile(r"^Bitmap\.clear_screen\(\)$")
+
 # --- modulo Teclado -------------------------------------------------------
 # OnClick(1) {   -> abre um callback bloqueante para a tecla '1' (ou A-F)
 RE_ONCLICK_OPEN = re.compile(r"^OnClick\(\s*([0-9A-Fa-f])\s*\)\s*\{$")
+
+# --- CALLKEY (nao-bloqueante, para usar dentro de While/For) -------------
+# Funct.CALLKEY.(1){   -> define o bloco da tecla '1'
+RE_CALLKEY_DEF = re.compile(r"^Funct\.CALLKEY\.\(\s*([0-9A-Fa-f])\s*\)\s*\{$")
+# CALLKEY.(1)          -> no fluxo: se tecla '1' estiver pressionada, executa o bloco
+RE_CALLKEY_USE = re.compile(r"^CALLKEY\.\(\s*([0-9A-Fa-f])\s*\)$")
 
 
 def parse_line(line: str):
@@ -1359,6 +1556,14 @@ def parse_line(line: str):
         key_name = m.group(1).upper()
         return ("onclick_open", key_name)
 
+    m = RE_CALLKEY_DEF.match(line)
+    if m:
+        return ("callkey_def_open", m.group(1).upper())
+
+    m = RE_CALLKEY_USE.match(line)
+    if m:
+        return ("callkey_use", m.group(1).upper())
+
     m = RE_RETURN.match(line)
     if m:
         return ("return", m.group(1))
@@ -1399,6 +1604,21 @@ def parse_line(line: str):
     if m:
         return ("display_clear", m.group(1))
 
+    m = RE_BITMAP_SET_PIXEL.match(line)
+    if m:
+        return ("bitmap_set_pixel", m.group(1), m.group(2), m.group(3))
+
+    m = RE_BITMAP_FILL.match(line)
+    if m:
+        return ("bitmap_fill_screen", m.group(1))
+
+    m = RE_BITMAP_DRAW_SQUARE.match(line)
+    if m:
+        return ("bitmap_draw_square", m.group(1), m.group(2), m.group(3), m.group(4))
+
+    if RE_BITMAP_CLEAR.match(line):
+        return ("bitmap_clear_screen",)
+
     m = RE_INPUT_INT.match(line)
     if m:
         return ("input_int", m.group(1))
@@ -1426,6 +1646,10 @@ def parse_line(line: str):
     m = RE_WRITEFILE.match(line)
     if m:
         return ("writefile", m.group(1), m.group(2))
+
+    m = RE_STR_LITERAL.match(line)
+    if m:
+        return ("str_literal", m.group(1), m.group(2))
 
     m = RE_INT_LITERAL.match(line)
     if m:
@@ -1538,7 +1762,18 @@ def parse_block(lines, start=0, _top_level=True):
             tree.append(("onclick_def", key_name, onclick_body))
             continue
 
-        # instrucao simples
+        if instr[0] == "callkey_def_open":
+            (_, key_name) = instr
+            if not _top_level:
+                raise SyntaxError(
+                    f"'Funct.CALLKEY.({key_name})' so pode ser declarado no nivel "
+                    f"mais externo do arquivo (nao dentro de if, While, funcao, etc)"
+                )
+            callkey_body, i = parse_block(lines, i + 1, _top_level=False)
+            tree.append(("callkey_def", key_name, callkey_body))
+            continue
+
+        # instrucao simples (inclui callkey_use, que nao abre bloco)
         tree.append(instr)
         i += 1
 
@@ -1584,6 +1819,15 @@ def compile_block(tree, symtab, codegen, imported_modules):
         elif kind == "int_literal":
             (_, var, value) = instr
             codegen.gen_int_literal(var, value)
+
+        elif kind == "str_literal":
+            (_, var, text) = instr
+            if symtab.exists(var) and symtab.type_of(var) != "str":
+                raise TypeError(
+                    f"str({var}, \"...\"): '{var}' ja foi declarado como "
+                    f"'{symtab.type_of(var)}'; nao pode virar str"
+                )
+            codegen.gen_str_literal(var, text)
 
         elif kind == "out":
             (_, var) = instr
@@ -1632,7 +1876,7 @@ def compile_block(tree, symtab, codegen, imported_modules):
 
         elif kind == "import":
             (_, module_name) = instr
-            if module_name not in ("Display", "Teclado"):
+            if module_name not in ("Display", "Teclado", "Bitmap"):
                 raise SyntaxError(f"Modulo desconhecido em [IMPOR]: '{module_name}'")
             imported_modules.add(module_name)
 
@@ -1710,6 +1954,29 @@ def compile_block(tree, symtab, codegen, imported_modules):
                 )
             codegen.gen_display_clear(display)
 
+        elif kind == "bitmap_set_pixel":
+            (_, x_tok, y_tok, cor_tok) = instr
+            if "Bitmap" not in imported_modules:
+                raise NameError("'Bitmap.set_pixel(...)' usado sem '[IMPOR] Bitmap;' no topo do arquivo")
+            codegen.gen_bitmap_set_pixel(x_tok, y_tok, cor_tok)
+
+        elif kind == "bitmap_fill_screen":
+            (_, cor_tok) = instr
+            if "Bitmap" not in imported_modules:
+                raise NameError("'Bitmap.fill_screen(...)' usado sem '[IMPOR] Bitmap;' no topo do arquivo")
+            codegen.gen_bitmap_fill_screen(cor_tok)
+
+        elif kind == "bitmap_draw_square":
+            (_, x_tok, y_tok, size_tok, cor_tok) = instr
+            if "Bitmap" not in imported_modules:
+                raise NameError("'Bitmap.draw_square(...)' usado sem '[IMPOR] Bitmap;' no topo do arquivo")
+            codegen.gen_bitmap_draw_square(x_tok, y_tok, size_tok, cor_tok)
+
+        elif kind == "bitmap_clear_screen":
+            if "Bitmap" not in imported_modules:
+                raise NameError("'Bitmap.clear_screen()' usado sem '[IMPOR] Bitmap;' no topo do arquivo")
+            codegen.gen_bitmap_clear_screen()
+
         elif kind == "return":
             (_, value_token) = instr
             codegen.gen_return(value_token)
@@ -1746,9 +2013,6 @@ def compile_block(tree, symtab, codegen, imported_modules):
 
             callback_label = codegen._new_label(f"onclick_{key_name}_callback")
 
-            # compila o corpo do callback ISOLADO (memoria propria, igual
-            # uma funcao sem parametros), e anexa o resultado para ser
-            # colocado fora do fluxo normal (so alcancado via jalr)
             callback_text, callback_data_decl, cb_mul, cb_div, cb_display = compile_onclick_callback(
                 callback_label, onclick_body, imported_modules
             )
@@ -1758,8 +2022,45 @@ def compile_block(tree, symtab, codegen, imported_modules):
             codegen._uses_div = codegen._uses_div or cb_div
             codegen._uses_display = codegen._uses_display or cb_display
 
-            # emite a chamada bloqueante exatamente neste ponto do fluxo
             codegen.gen_onclick_call(key_name, callback_label)
+
+        elif kind == "callkey_def":
+            (_, key_name, callkey_body) = instr
+            if "Teclado" not in imported_modules:
+                raise NameError(
+                    f"'Funct.CALLKEY.({key_name})' usado sem '[IMPOR] Teclado;' no topo do arquivo"
+                )
+            if key_name in codegen._callkey_labels:
+                raise SyntaxError(
+                    f"'Funct.CALLKEY.({key_name})' declarado mais de uma vez"
+                )
+
+            body_label = f"callkey_{key_name}_body"
+
+            # compila o corpo como mini-funcao sem parametros e sem retorno,
+            # igual ao OnClick, usando compile_onclick_callback
+            body_text, body_data_decl, cb_mul, cb_div, cb_display = compile_onclick_callback(
+                body_label, callkey_body, imported_modules
+            )
+            codegen._onclick_callbacks.append(body_text)
+            codegen._onclick_data_decls.append(body_data_decl)
+            codegen._uses_mul = codegen._uses_mul or cb_mul
+            codegen._uses_div = codegen._uses_div or cb_div
+            codegen._uses_display = codegen._uses_display or cb_display
+            codegen._uses_keyboard = True
+
+            # registra o label para que CALLKEY.(N) saiba onde pular
+            codegen._callkey_labels[key_name] = body_label
+            # callkey_def NAO gera codigo inline no fluxo principal --
+            # a declaracao fica so como sub-rotina, invocada por CALLKEY.(N)
+
+        elif kind == "callkey_use":
+            (_, key_name) = instr
+            if "Teclado" not in imported_modules:
+                raise NameError(
+                    f"'CALLKEY.({key_name})' usado sem '[IMPOR] Teclado;' no topo do arquivo"
+                )
+            codegen.gen_callkey_call(key_name)
 
         elif kind == "if":
             (_, condition, then_body, else_body) = instr
@@ -1878,9 +2179,13 @@ def compile_onclick_callback(callback_label, body, imported_modules):
     # declaracao de funcao" - reaproveitando a checagem que ja existe em
     # gen_return, sem precisar duplicar logica
     cb_codegen.emit(f"{callback_label}:")
+    cb_codegen.emit("\taddi $sp, $sp, -4")
+    cb_codegen.emit("\tsw $ra, 0($sp)")
 
     compile_block(body, cb_symtab, cb_codegen, imported_modules)
 
+    cb_codegen.emit("\tlw $ra, 0($sp)")
+    cb_codegen.emit("\taddi $sp, $sp, 4")
     cb_codegen.emit("\tjr $ra")
 
     cb_text = "\n".join(cb_codegen.lines)
